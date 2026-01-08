@@ -1,0 +1,6 @@
+notion-client 
+groq 
+fastapi
+uvicorn 
+python-dotenv 
+pyinstaller
