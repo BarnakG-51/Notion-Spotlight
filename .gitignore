@@ -1,1 +1,4 @@
-flutter/
+notion-spotlight-mvp/.env
+notion-spotlight-mvp/backend/.env
+.env
+venv/
