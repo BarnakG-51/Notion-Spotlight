@@ -226,7 +226,7 @@ async def process_prompt(prompt: Prompt):
     try:
         # Call Groq with tool calling
         response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
                 {
                     "role": "system",
