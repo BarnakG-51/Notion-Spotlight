@@ -1,2 +1,0 @@
-{"time": "2026-01-10T00:02:30.002405", "event": "token_request", "payload": {"grant_type": "authorization_code", "code": "03625c22-b76d-46ad-a2ec-8e58a40a04fb", "redirect_uri": "http://localhost:8001/oauth/callback", "client_id": "2e3d872b-594c-8071-ad93-003742032f45", "client_secret": "***REDACTED***"}}
-{"time": "2026-01-10T00:02:30.400513", "event": "token_response", "response": {"error": "invalid_client", "request_id": "60caf844-9e75-4d38-91a5-d2b5e6370ea9"}, "status_code": 401}

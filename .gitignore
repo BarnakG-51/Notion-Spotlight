@@ -2,3 +2,7 @@ notion-spotlight-mvp/.env
 notion-spotlight-mvp/backend/.env
 .env
 venv/
+oauth-debug.log
+oauth_debug.log
+notion-spotlight-mvp/backend/user_tokens.json
+user_tokens.json

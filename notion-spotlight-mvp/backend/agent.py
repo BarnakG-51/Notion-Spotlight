@@ -105,14 +105,18 @@ def refresh_tokens(user_id: str):
     payload = {
         'grant_type': 'refresh_token',
         'refresh_token': refresh_token,
-        'client_id': NOTION_CLIENT_ID,
-        'client_secret': NOTION_CLIENT_SECRET,
     }
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+    # Use Basic Auth as per Notion OAuth spec
+    import base64
+    auth_string = base64.b64encode(f"{NOTION_CLIENT_ID}:{NOTION_CLIENT_SECRET}".encode()).decode()
+    headers = {
+        'Authorization': f'Basic {auth_string}',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
 
     # Log outgoing request (masking secret)
     debug_log('refresh_request', payload=payload)
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, data=payload, headers=headers)
     debug_log('refresh_response', payload=None, response=response)
 
     # Helpful debugging output if the exchange fails
@@ -125,12 +129,15 @@ def refresh_tokens(user_id: str):
         raise HTTPException(status_code=401, detail=f"Failed to refresh token: {detail}")
 
     data = response.json()
+    # Notion tokens don't expire, but set a far future date for consistency
+    expires_at = (datetime.now() + timedelta(days=365*10)).isoformat()
     tokens[user_id] = {
         'access_token': data['access_token'],
         'refresh_token': data.get('refresh_token', refresh_token),
-        'expires_at': (datetime.now() + timedelta(seconds=data['expires_in'])).isoformat(),
+        'expires_at': expires_at,
         'workspace_id': data.get('workspace_id'),
         'workspace_name': data.get('workspace_name'),
+        'bot_id': data.get('bot_id'),
     }
     save_tokens(tokens)
 
@@ -166,14 +173,18 @@ async def oauth_callback(code: str = Query(...), state: str = Query(...)):
         'grant_type': 'authorization_code',
         'code': code,
         'redirect_uri': NOTION_REDIRECT_URI,
-        'client_id': NOTION_CLIENT_ID,
-        'client_secret': NOTION_CLIENT_SECRET,
     }
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+    # Use Basic Auth as per Notion OAuth spec
+    import base64
+    auth_string = base64.b64encode(f"{NOTION_CLIENT_ID}:{NOTION_CLIENT_SECRET}".encode()).decode()
+    headers = {
+        'Authorization': f'Basic {auth_string}',
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
 
     # Log outgoing request (masking secret)
     debug_log('token_request', payload=payload)
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, data=payload, headers=headers)
     debug_log('token_response', payload=None, response=response)
 
     if response.status_code != 200:
@@ -190,20 +201,161 @@ async def oauth_callback(code: str = Query(...), state: str = Query(...)):
     # Generate user ID and store tokens
     user_id = str(uuid.uuid4())
     tokens = load_tokens()
+    # Notion tokens don't expire, but set a far future date for consistency
+    expires_at = (datetime.now() + timedelta(days=365*10)).isoformat()
+    
+    # Create Notion client with the new access token to fetch databases
+    notion = Client(auth=data['access_token'])
+    
+    # Fetch all databases the user has access to
+    databases = {}
+    try:
+        print(f"Fetching databases for user...")
+        # Search all objects and filter for databases
+        search_response = notion.search()
+        print(f"Search returned {len(search_response.get('results', []))} results")
+        for item in search_response.get('results', []):
+            # Only process database objects
+            if item.get('object') == 'database':
+                db_id = item['id']
+                db_title = 'Untitled'
+                # Extract database title
+                if 'title' in item and len(item['title']) > 0:
+                    db_title = item['title'][0].get('plain_text', 'Untitled')
+                databases[db_id] = {
+                    'id': db_id,
+                    'title': db_title,
+                    'url': item.get('url', '')
+                }
+                print(f"Found database: {db_title}")
+    except Exception as e:
+        print(f"Warning: Could not fetch databases: {e}")
+        import traceback
+        traceback.print_exc()
+    
     tokens[user_id] = {
         'access_token': data['access_token'],
         'refresh_token': data.get('refresh_token'),
-        'expires_at': (datetime.now() + timedelta(seconds=data['expires_in'])).isoformat(),
+        'expires_at': expires_at,
         'workspace_id': data.get('workspace_id'),
         'workspace_name': data.get('workspace_name'),
+        'bot_id': data.get('bot_id'),
+        'databases': databases,
     }
     save_tokens(tokens)
     
     return {
         "message": "Authentication successful!",
         "user_id": user_id,
-        "workspace_name": data.get('workspace_name', 'Unknown Workspace')
+        "workspace_name": data.get('workspace_name', 'Unknown Workspace'),
+        "databases": databases
     }
+
+@app.get("/user/{user_id}/databases")
+async def get_user_databases(user_id: str):
+    """Get all databases for a user"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    databases = tokens[user_id].get('databases', {})
+    return {
+        "user_id": user_id,
+        "databases": list(databases.values())
+    }
+
+@app.post("/user/{user_id}/databases/refresh")
+async def refresh_user_databases(user_id: str):
+    """Refresh the list of databases for a user"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Create Notion client directly with access token (avoid circular dependency with get_notion_client)
+    access_token = tokens[user_id].get('access_token')
+    if not access_token:
+        raise HTTPException(status_code=401, detail="No access token found")
+    
+    notion = Client(auth=access_token)
+    
+    databases = {}
+    try:
+        # Search all objects and filter for databases
+        search_response = notion.search()
+        for item in search_response.get('results', []):
+            # Only process database objects
+            if item.get('object') == 'database':
+                db_id = item['id']
+                db_title = 'Untitled'
+                if 'title' in item and len(item['title']) > 0:
+                    db_title = item['title'][0].get('plain_text', 'Untitled')
+                databases[db_id] = {
+                    'id': db_id,
+                    'title': db_title,
+                    'url': item.get('url', '')
+                }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch databases: {str(e)}")
+    
+    # Update stored databases
+    tokens = load_tokens()
+    tokens[user_id]['databases'] = databases
+    save_tokens(tokens)
+    
+    return {
+        "message": "Databases refreshed successfully",
+        "databases": list(databases.values())
+    }
+
+@app.delete("/user/{user_id}/logout")
+async def logout_user(user_id: str):
+    """Logout a user by removing their tokens"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    workspace_name = tokens[user_id].get('workspace_name', 'Unknown')
+    del tokens[user_id]
+    save_tokens(tokens)
+    
+    return {
+        "message": f"Successfully logged out from {workspace_name}",
+        "user_id": user_id
+    }
+
+@app.get("/users")
+async def list_users():
+    """List all logged in users"""
+    tokens = load_tokens()
+    users = []
+    for user_id, token_data in tokens.items():
+        users.append({
+            "user_id": user_id,
+            "workspace_name": token_data.get('workspace_name', 'Unknown'),
+            "database_count": len(token_data.get('databases', {}))
+        })
+    return {"users": users}
+
+def get_database_id_by_name(user_id: str, database_name: str) -> Optional[str]:
+    """Find a database ID by its name (case-insensitive partial match)"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        return None
+    
+    databases = tokens[user_id].get('databases', {})
+    database_name_lower = database_name.lower()
+    
+    # Try exact match first
+    for db_id, db_info in databases.items():
+        if db_info['title'].lower() == database_name_lower:
+            return db_id
+    
+    # Try partial match
+    for db_id, db_info in databases.items():
+        if database_name_lower in db_info['title'].lower():
+            return db_id
+    
+    return None
 
 class Prompt(BaseModel):
     text: str
@@ -260,6 +412,18 @@ tools = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_databases",
+            "description": "List all Notion databases the user has access to",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
     }
 ]
 
@@ -270,11 +434,14 @@ def mark_habit_done(user_id: str, habit_name: str):
     except HTTPException:
         return "❌ User not authenticated"
 
-    # You'll need to replace these with your actual database IDs
-    habit_db_id = os.getenv("HABIT_DB_ID")  # Your Habit Tracker database ID
-
+    # Try to find a database with 'habit' in the name
+    habit_db_id = get_database_id_by_name(user_id, "habit")
     if not habit_db_id:
-        return "❌ HABIT_DB_ID not set in environment variables"
+        # Fallback to environment variable for backward compatibility
+        habit_db_id = os.getenv("HABIT_DB_ID")
+    
+    if not habit_db_id:
+        return "❌ No Habit database found. Please ensure you have a database with 'habit' in its name and the integration has access to it."
 
     try:
         response = notion.databases.query(
@@ -311,10 +478,17 @@ def create_reminder(user_id: str, task: str, time: str):
     except HTTPException:
         return "❌ User not authenticated"
 
-    todo_db_id = os.getenv("TODO_DB_ID")  # Your To-Do database ID
-
+    # Try to find a database with 'todo' or 'task' or 'reminder' in the name
+    todo_db_id = get_database_id_by_name(user_id, "todo") or \
+                 get_database_id_by_name(user_id, "task") or \
+                 get_database_id_by_name(user_id, "reminder")
+    
     if not todo_db_id:
-        return "❌ TODO_DB_ID not set in environment variables"
+        # Fallback to environment variable for backward compatibility
+        todo_db_id = os.getenv("TODO_DB_ID")
+    
+    if not todo_db_id:
+        return "❌ No To-Do/Task database found. Please ensure you have a database with 'todo', 'task', or 'reminder' in its name and the integration has access to it."
 
     # Parse time (simple implementation - you can enhance this)
     reminder_date = None
@@ -362,6 +536,23 @@ def create_reminder(user_id: str, task: str, time: str):
     except Exception as e:
         return f"❌ Error creating reminder: {str(e)}"
 
+def list_databases(user_id: str):
+    """List all databases the user has access to"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        return "❌ User not authenticated"
+    
+    databases = tokens[user_id].get('databases', {})
+    
+    if not databases:
+        return "📊 No databases found. You may need to refresh your databases or grant access to your Notion integration."
+    
+    db_list = []
+    for db_id, db_info in databases.items():
+        db_list.append(f"• {db_info['title']}")
+    
+    return f"📊 Available Databases ({len(databases)}):\n" + "\n".join(db_list)
+
 def show_reminders(user_id: str):
     """Show recent reminders from Notion"""
     try:
@@ -369,10 +560,17 @@ def show_reminders(user_id: str):
     except HTTPException:
         return "❌ User not authenticated"
 
-    todo_db_id = os.getenv("TODO_DB_ID")
+    # Try to find a database with 'todo' or 'task' or 'reminder' in the name
+    todo_db_id = get_database_id_by_name(user_id, "todo") or \
+                 get_database_id_by_name(user_id, "task") or \
+                 get_database_id_by_name(user_id, "reminder")
+    
+    if not todo_db_id:
+        # Fallback to environment variable for backward compatibility
+        todo_db_id = os.getenv("TODO_DB_ID")
 
     if not todo_db_id:
-        return "❌ TODO_DB_ID not set in environment variables"
+        return "❌ No To-Do/Task database found. Please ensure you have a database with 'todo', 'task', or 'reminder' in its name and the integration has access to it."
 
     try:
         # Query recent pages
@@ -442,6 +640,8 @@ async def process_prompt(prompt: Prompt):
                 result = create_reminder(prompt.user_id, arguments["task"], arguments["time"])
             elif function_name == "show_reminders":
                 result = show_reminders(prompt.user_id)
+            elif function_name == "list_databases":
+                result = list_databases(prompt.user_id)
             else:
                 result = "❌ Unknown action"
 
