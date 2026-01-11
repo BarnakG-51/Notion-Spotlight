@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi.responses import RedirectResponse
 from notion_client import Client
 from groq import Groq
 import os
@@ -6,26 +7,207 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import json
 from dotenv import load_dotenv
+import requests
+import uuid
+from typing import Optional
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
-# Initialize clients (will fail gracefully if keys not set)
-notion = None
-groq_client = None
+# OAuth Configuration
+NOTION_CLIENT_ID = os.getenv("NOTION_CLIENT_ID")
+NOTION_CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET")
+NOTION_REDIRECT_URI = os.getenv("NOTION_REDIRECT_URI", "http://localhost:8001/oauth/callback")
+TOKEN_STORAGE_FILE = "user_tokens.json"
+DEBUG_LOG_FILE = "oauth_debug.log"
 
+# Initialize Groq client
+groq_client = None
 try:
-    if os.getenv("NOTION_API_KEY"):
-        notion = Client(auth=os.getenv("NOTION_API_KEY"))
     if os.getenv("GROQ_API_KEY"):
         groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 except Exception as e:
-    print(f"Warning: Could not initialize API clients: {e}")
+    print(f"Warning: Could not initialize Groq client: {e}")
+
+# Token storage functions
+def load_tokens():
+    """Load user tokens from file"""
+    try:
+        with open(TOKEN_STORAGE_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def debug_log(event: str, payload: Optional[dict] = None, response: Optional[object] = None):
+    """Append a masked debug line to the debug log file. Best-effort only."""
+    try:
+        entry = {"time": datetime.now().isoformat(), "event": event}
+        if payload is not None:
+            p = dict(payload)
+            # Mask sensitive fields
+            if 'client_secret' in p:
+                p['client_secret'] = '***REDACTED***'
+            entry['payload'] = p
+        if response is not None:
+            try:
+                entry['response'] = response.json()
+            except Exception:
+                try:
+                    entry['response_text'] = response.text
+                except Exception:
+                    entry['response_text'] = '<unavailable>'
+            try:
+                entry['status_code'] = response.status_code
+            except Exception:
+                entry['status_code'] = None
+
+        with open(DEBUG_LOG_FILE, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        # Do not raise logging errors
+        try:
+            with open(DEBUG_LOG_FILE, 'a') as f:
+                f.write(f"{datetime.now().isoformat()} - debug_log failure\n")
+        except Exception:
+            pass
+
+def save_tokens(tokens):
+    """Save user tokens to file"""
+    with open(TOKEN_STORAGE_FILE, 'w') as f:
+        json.dump(tokens, f, indent=2)
+
+def get_notion_client(user_id: str):
+    """Get Notion client for a specific user"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+    
+    user_tokens = tokens[user_id]
+    if datetime.fromisoformat(user_tokens['expires_at']) < datetime.now():
+        # Token expired, refresh it
+        refresh_tokens(user_id)
+        tokens = load_tokens()
+        user_tokens = tokens[user_id]
+    
+    return Client(auth=user_tokens['access_token'])
+
+def refresh_tokens(user_id: str):
+    """Refresh expired access token"""
+    tokens = load_tokens()
+    if user_id not in tokens:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+    
+    refresh_token = tokens[user_id]['refresh_token']
+    
+    url = 'https://api.notion.com/v1/oauth/token'
+    payload = {
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+        'client_id': NOTION_CLIENT_ID,
+        'client_secret': NOTION_CLIENT_SECRET,
+    }
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+
+    # Log outgoing request (masking secret)
+    debug_log('refresh_request', payload=payload)
+    response = requests.post(url, json=payload, headers=headers)
+    debug_log('refresh_response', payload=None, response=response)
+
+    # Helpful debugging output if the exchange fails
+    if response.status_code != 200:
+        detail = None
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        raise HTTPException(status_code=401, detail=f"Failed to refresh token: {detail}")
+
+    data = response.json()
+    tokens[user_id] = {
+        'access_token': data['access_token'],
+        'refresh_token': data.get('refresh_token', refresh_token),
+        'expires_at': (datetime.now() + timedelta(seconds=data['expires_in'])).isoformat(),
+        'workspace_id': data.get('workspace_id'),
+        'workspace_name': data.get('workspace_name'),
+    }
+    save_tokens(tokens)
+
+# OAuth endpoints
+@app.get("/oauth/authorize")
+async def authorize():
+    """Start OAuth flow"""
+    if not NOTION_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="NOTION_CLIENT_ID not configured")
+    
+    state = str(uuid.uuid4())  # Generate a unique state for security
+    
+    auth_url = (
+        "https://api.notion.com/v1/oauth/authorize?"
+        f"client_id={NOTION_CLIENT_ID}&"
+        f"response_type=code&"
+        f"owner=user&"
+        f"redirect_uri={NOTION_REDIRECT_URI}&"
+        f"state={state}"
+    )
+    
+    return {"auth_url": auth_url, "state": state}
+
+@app.get("/oauth/callback")
+async def oauth_callback(code: str = Query(...), state: str = Query(...)):
+    """Handle OAuth callback"""
+    if not NOTION_CLIENT_ID or not NOTION_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="OAuth credentials not configured")
+    
+    # Exchange code for tokens
+    url = 'https://api.notion.com/v1/oauth/token'
+    payload = {
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': NOTION_REDIRECT_URI,
+        'client_id': NOTION_CLIENT_ID,
+        'client_secret': NOTION_CLIENT_SECRET,
+    }
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+
+    # Log outgoing request (masking secret)
+    debug_log('token_request', payload=payload)
+    response = requests.post(url, json=payload, headers=headers)
+    debug_log('token_response', payload=None, response=response)
+
+    if response.status_code != 200:
+        # Include the remote response body to help debug (Notion returns JSON error)
+        detail = None
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        raise HTTPException(status_code=400, detail=f"Failed to exchange code for tokens: {detail}")
+
+    data = response.json()
+    
+    # Generate user ID and store tokens
+    user_id = str(uuid.uuid4())
+    tokens = load_tokens()
+    tokens[user_id] = {
+        'access_token': data['access_token'],
+        'refresh_token': data.get('refresh_token'),
+        'expires_at': (datetime.now() + timedelta(seconds=data['expires_in'])).isoformat(),
+        'workspace_id': data.get('workspace_id'),
+        'workspace_name': data.get('workspace_name'),
+    }
+    save_tokens(tokens)
+    
+    return {
+        "message": "Authentication successful!",
+        "user_id": user_id,
+        "workspace_name": data.get('workspace_name', 'Unknown Workspace')
+    }
 
 class Prompt(BaseModel):
     text: str
+    user_id: str
 
 # Tool definitions for Groq
 tools = [
@@ -81,10 +263,12 @@ tools = [
     }
 ]
 
-def mark_habit_done(habit_name: str):
+def mark_habit_done(user_id: str, habit_name: str):
     """Mark a habit as done in Notion Habit Tracker database"""
-    if not notion:
-        return "❌ Notion client not initialized"
+    try:
+        notion = get_notion_client(user_id)
+    except HTTPException:
+        return "❌ User not authenticated"
 
     # You'll need to replace these with your actual database IDs
     habit_db_id = os.getenv("HABIT_DB_ID")  # Your Habit Tracker database ID
@@ -120,10 +304,12 @@ def mark_habit_done(habit_name: str):
     except Exception as e:
         return f"❌ Error updating habit: {str(e)}"
 
-def create_reminder(task: str, time: str):
+def create_reminder(user_id: str, task: str, time: str):
     """Create a reminder task in Notion"""
-    if not notion:
-        return "❌ Notion client not initialized"
+    try:
+        notion = get_notion_client(user_id)
+    except HTTPException:
+        return "❌ User not authenticated"
 
     todo_db_id = os.getenv("TODO_DB_ID")  # Your To-Do database ID
 
@@ -176,10 +362,12 @@ def create_reminder(task: str, time: str):
     except Exception as e:
         return f"❌ Error creating reminder: {str(e)}"
 
-def show_reminders():
+def show_reminders(user_id: str):
     """Show recent reminders from Notion"""
-    if not notion:
-        return "❌ Notion client not initialized"
+    try:
+        notion = get_notion_client(user_id)
+    except HTTPException:
+        return "❌ User not authenticated"
 
     todo_db_id = os.getenv("TODO_DB_ID")
 
@@ -220,8 +408,8 @@ def show_reminders():
 
 @app.post("/prompt")
 async def process_prompt(prompt: Prompt):
-    if not groq_client or not notion:
-        return {"status": "error", "message": "API keys not configured. Please set NOTION_API_KEY and GROQ_API_KEY in .env file"}
+    if not groq_client:
+        return {"status": "error", "message": "GROQ_API_KEY not configured"}
 
     try:
         # Call Groq with tool calling
@@ -249,11 +437,11 @@ async def process_prompt(prompt: Prompt):
 
             # Execute the appropriate function
             if function_name == "mark_habit_done":
-                result = mark_habit_done(arguments["habit_name"])
+                result = mark_habit_done(prompt.user_id, arguments["habit_name"])
             elif function_name == "create_reminder":
-                result = create_reminder(arguments["task"], arguments["time"])
+                result = create_reminder(prompt.user_id, arguments["task"], arguments["time"])
             elif function_name == "show_reminders":
-                result = show_reminders()
+                result = show_reminders(prompt.user_id)
             else:
                 result = "❌ Unknown action"
 
